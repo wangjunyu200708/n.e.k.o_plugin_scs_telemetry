@@ -1,0 +1,10 @@
+[plugin]
+id = "scs_telemetry"
+name = "SCS Telemetry Plugin"
+description = "将 Euro Truck Simulator 2 和 American Truck Simulator 的遥测数据集成到 N.E.K.O 系统"
+version = "1.0.0"
+entry = "plugins.scs_telemetry:SCSTelemetryPlugin"
+
+[plugin.sdk]
+recommended = ">=0.1.0,<0.2.0"
+supported = ">=0.1.0,<0.3.0"

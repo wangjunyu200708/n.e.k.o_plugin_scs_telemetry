@@ -1,0 +1,909 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>SCS 虚拟座舱</title>
+    <style>
+        :root {
+            --bg: #0a0a0f;
+            --panel: #12121a;
+            --ring-bg: #1a1a28;
+            --ring-track: #252538;
+            --accent: #ff4400;
+            --accent-glow: rgba(255, 68, 0, 0.4);
+            --green: #00e676;
+            --green-glow: rgba(0, 230, 118, 0.3);
+            --yellow: #ffd600;
+            --red: #ff1744;
+            --blue: #448aff;
+            --white: #e8e8f0;
+            --gray: #6e6e8a;
+            --dim: #3a3a52;
+        }
+
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+
+        body {
+            font-family: 'Segoe UI', 'Consolas', monospace;
+            background: var(--bg);
+            color: var(--white);
+            min-height: 100vh;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            overflow: hidden;
+            user-select: none;
+        }
+
+        /* ── Top bar: warning lights ── */
+        .warning-bar {
+            display: flex;
+            justify-content: center;
+            gap: 6px;
+            margin-bottom: 12px;
+            flex-wrap: wrap;
+        }
+
+        .warn-icon {
+            width: 36px;
+            height: 36px;
+            border-radius: 6px;
+            background: var(--panel);
+            border: 1px solid var(--dim);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 16px;
+            opacity: 0.25;
+            transition: opacity 0.3s, box-shadow 0.3s;
+        }
+
+        .warn-icon.active {
+            opacity: 1;
+        }
+        .warn-icon.active.red { box-shadow: 0 0 12px var(--red); border-color: var(--red); }
+        .warn-icon.active.yellow { box-shadow: 0 0 12px var(--yellow); border-color: var(--yellow); }
+        .warn-icon.active.green { box-shadow: 0 0 12px var(--green); border-color: var(--green); }
+        .warn-icon.active.blue { box-shadow: 0 0 12px var(--blue); border-color: var(--blue); }
+
+        /* ── Main cockpit layout ── */
+        .cockpit {
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 0;
+            position: relative;
+        }
+
+        /* ── Gauge (RPM / Speed) ── */
+        .gauge-container {
+            position: relative;
+            width: 320px;
+            height: 320px;
+        }
+
+        .gauge-canvas {
+            width: 100%;
+            height: 100%;
+        }
+
+        .gauge-center {
+            position: absolute;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            text-align: center;
+        }
+
+        .gauge-value {
+            font-size: 48px;
+            font-weight: 700;
+            line-height: 1;
+            letter-spacing: -2px;
+        }
+
+        .gauge-unit {
+            font-size: 14px;
+            color: var(--gray);
+            margin-top: 2px;
+        }
+
+        .gauge-label {
+            font-size: 11px;
+            color: var(--dim);
+            letter-spacing: 2px;
+            margin-top: 6px;
+        }
+
+        /* ── Center display ── */
+        .center-display {
+            width: 340px;
+            height: 300px;
+            background: var(--panel);
+            border: 1px solid var(--ring-track);
+            border-radius: 16px;
+            padding: 16px 20px;
+            display: flex;
+            flex-direction: column;
+            overflow: hidden;
+            position: relative;
+        }
+
+        .center-top {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 8px;
+            padding-bottom: 8px;
+            border-bottom: 1px solid var(--ring-track);
+        }
+
+        .game-info {
+            font-size: 12px;
+            color: var(--gray);
+        }
+
+        .game-info .game-name {
+            font-weight: 600;
+            color: var(--white);
+            font-size: 13px;
+        }
+
+        .connection-dot {
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            background: var(--red);
+            margin-right: 6px;
+            display: inline-block;
+            transition: background 0.3s, box-shadow 0.3s;
+        }
+
+        .connection-dot.online {
+            background: var(--green);
+            box-shadow: 0 0 8px var(--green-glow);
+        }
+
+        /* Gear display */
+        .gear-display {
+            text-align: center;
+            padding: 6px 0 10px;
+        }
+
+        .gear-letter {
+            font-size: 56px;
+            font-weight: 800;
+            line-height: 1;
+            color: var(--accent);
+            text-shadow: 0 0 20px var(--accent-glow);
+        }
+
+        .gear-sub {
+            font-size: 11px;
+            color: var(--dim);
+            margin-top: 2px;
+        }
+
+        /* Info grid */
+        .info-grid {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 6px 16px;
+            flex: 1;
+        }
+
+        .info-item {
+            display: flex;
+            flex-direction: column;
+        }
+
+        .info-label {
+            font-size: 10px;
+            color: var(--dim);
+            letter-spacing: 1px;
+        }
+
+        .info-val {
+            font-size: 16px;
+            font-weight: 600;
+            color: var(--white);
+        }
+
+        .info-val.warn { color: var(--yellow); }
+        .info-val.danger { color: var(--red); }
+
+        /* Fuel bar */
+        .fuel-bar-wrap {
+            margin-top: auto;
+            padding-top: 8px;
+            border-top: 1px solid var(--ring-track);
+        }
+
+        .fuel-bar-header {
+            display: flex;
+            justify-content: space-between;
+            font-size: 10px;
+            color: var(--dim);
+            letter-spacing: 1px;
+            margin-bottom: 4px;
+        }
+
+        .fuel-bar {
+            height: 6px;
+            background: var(--ring-bg);
+            border-radius: 3px;
+            overflow: hidden;
+        }
+
+        .fuel-bar-fill {
+            height: 100%;
+            border-radius: 3px;
+            background: var(--green);
+            transition: width 0.5s, background 0.3s;
+        }
+
+        .fuel-bar-fill.low { background: var(--yellow); }
+        .fuel-bar-fill.critical { background: var(--red); }
+
+        /* ── Bottom info strip ── */
+        .bottom-strip {
+            display: flex;
+            justify-content: center;
+            gap: 32px;
+            margin-top: 16px;
+            padding: 8px 24px;
+            background: var(--panel);
+            border-radius: 10px;
+            border: 1px solid var(--ring-track);
+        }
+
+        .strip-item {
+            text-align: center;
+        }
+
+        .strip-label {
+            font-size: 9px;
+            color: var(--dim);
+            letter-spacing: 1.5px;
+        }
+
+        .strip-value {
+            font-size: 15px;
+            font-weight: 600;
+        }
+
+        /* ── Damage bars ── */
+        .damage-section {
+            margin-top: auto;
+            padding-top: 6px;
+            border-top: 1px solid var(--ring-track);
+        }
+
+        .damage-row {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            margin-bottom: 3px;
+        }
+
+        .damage-label {
+            font-size: 9px;
+            color: var(--dim);
+            width: 36px;
+        }
+
+        .damage-bar {
+            flex: 1;
+            height: 4px;
+            background: var(--ring-bg);
+            border-radius: 2px;
+            overflow: hidden;
+        }
+
+        .damage-fill {
+            height: 100%;
+            border-radius: 2px;
+            background: var(--green);
+            transition: width 0.5s, background 0.3s;
+        }
+
+        .damage-fill.mid { background: var(--yellow); }
+        .damage-fill.high { background: var(--red); }
+
+        /* ── Job panel (overlay when on job) ── */
+        .job-panel {
+            position: absolute;
+            bottom: 8px;
+            left: 50%;
+            transform: translateX(-50%);
+            background: rgba(18, 18, 26, 0.95);
+            border: 1px solid var(--blue);
+            border-radius: 8px;
+            padding: 6px 14px;
+            font-size: 11px;
+            color: var(--blue);
+            white-space: nowrap;
+            display: none;
+        }
+
+        .job-panel.active { display: block; }
+
+        /* ── Responsive ── */
+        @media (max-width: 1000px) {
+            .gauge-container { width: 240px; height: 240px; }
+            .gauge-value { font-size: 36px; }
+            .center-display { width: 280px; height: 240px; }
+            .gear-letter { font-size: 40px; }
+        }
+
+        @media (max-width: 700px) {
+            .cockpit { flex-direction: column; gap: 8px; }
+            .gauge-container { width: 200px; height: 200px; }
+            .gauge-value { font-size: 28px; }
+            .center-display { width: 90vw; height: auto; min-height: 200px; }
+            .bottom-strip { flex-wrap: wrap; gap: 16px; }
+        }
+    </style>
+</head>
+<body>
+
+    <!-- Warning lights -->
+    <div class="warning-bar">
+        <div class="warn-icon yellow" id="w-park">驻</div>
+        <div class="warn-icon red" id="w-fuel">油</div>
+        <div class="warn-icon red" id="w-air">气</div>
+        <div class="warn-icon red" id="w-oil">压</div>
+        <div class="warn-icon yellow" id="w-water">温</div>
+        <div class="warn-icon yellow" id="w-battery">电</div>
+        <div class="warn-icon green" id="w-cruise">巡</div>
+        <div class="warn-icon green" id="w-engine">擎</div>
+        <div class="warn-icon blue" id="w-left">左</div>
+        <div class="warn-icon blue" id="w-right">右</div>
+        <div class="warn-icon yellow" id="w-beacon">警</div>
+        <div class="warn-icon red" id="w-hazard">闪</div>
+    </div>
+
+    <!-- Main cockpit -->
+    <div class="cockpit">
+        <!-- Left: RPM gauge -->
+        <div class="gauge-container">
+            <canvas class="gauge-canvas" id="rpm-canvas"></canvas>
+            <div class="gauge-center">
+                <div class="gauge-value" id="rpm-value">0</div>
+                <div class="gauge-unit">RPM</div>
+                <div class="gauge-label">转速</div>
+            </div>
+        </div>
+
+        <!-- Center: info display -->
+        <div class="center-display">
+            <div class="center-top">
+                <div class="game-info">
+                    <span class="connection-dot" id="conn-dot"></span>
+                    <span class="game-name" id="game-name">--</span>
+                </div>
+                <div class="game-info">
+                    <span id="game-time">--:--</span>
+                </div>
+            </div>
+
+            <div class="gear-display">
+                <div class="gear-letter" id="gear-letter">N</div>
+                <div class="gear-sub" id="gear-sub">-- / --</div>
+            </div>
+
+            <div class="info-grid">
+                <div class="info-item">
+                    <span class="info-label">车速</span>
+                    <span class="info-val" id="v-speed">0 km/h</span>
+                </div>
+                <div class="info-item">
+                    <span class="info-label">限速</span>
+                    <span class="info-val" id="v-limit">--</span>
+                </div>
+                <div class="info-item">
+                    <span class="info-label">水温</span>
+                    <span class="info-val" id="v-water">-- &deg;C</span>
+                </div>
+                <div class="info-item">
+                    <span class="info-label">油温</span>
+                    <span class="info-val" id="v-oil-temp">-- &deg;C</span>
+                </div>
+                <div class="info-item">
+                    <span class="info-label">气压</span>
+                    <span class="info-val" id="v-air">-- bar</span>
+                </div>
+                <div class="info-item">
+                    <span class="info-label">油压</span>
+                    <span class="info-val" id="v-oil-press">-- bar</span>
+                </div>
+                <div class="info-item">
+                    <span class="info-label">电压</span>
+                    <span class="info-val" id="v-battery">-- V</span>
+                </div>
+                <div class="info-item">
+                    <span class="info-label">缓速器</span>
+                    <span class="info-val" id="v-retarder">0</span>
+                </div>
+            </div>
+
+            <!-- Fuel bar -->
+            <div class="fuel-bar-wrap">
+                <div class="fuel-bar-header">
+                    <span>燃油</span>
+                    <span id="fuel-text">-- L / -- L</span>
+                </div>
+                <div class="fuel-bar">
+                    <div class="fuel-bar-fill" id="fuel-fill" style="width: 0%"></div>
+                </div>
+            </div>
+
+            <!-- Damage bars -->
+            <div class="damage-section">
+                <div class="damage-row">
+                    <span class="damage-label">引擎</span>
+                    <div class="damage-bar"><div class="damage-fill" id="dmg-engine" style="width:0%"></div></div>
+                </div>
+                <div class="damage-row">
+                    <span class="damage-label">变速</span>
+                    <div class="damage-bar"><div class="damage-fill" id="dmg-trans" style="width:0%"></div></div>
+                </div>
+                <div class="damage-row">
+                    <span class="damage-label">驾驶</span>
+                    <div class="damage-bar"><div class="damage-fill" id="dmg-cabin" style="width:0%"></div></div>
+                </div>
+                <div class="damage-row">
+                    <span class="damage-label">底盘</span>
+                    <div class="damage-bar"><div class="damage-fill" id="dmg-chassis" style="width:0%"></div></div>
+                </div>
+                <div class="damage-row">
+                    <span class="damage-label">轮胎</span>
+                    <div class="damage-bar"><div class="damage-fill" id="dmg-wheels" style="width:0%"></div></div>
+                </div>
+            </div>
+
+            <!-- Job overlay -->
+            <div class="job-panel" id="job-panel">
+                <span id="job-text">--</span>
+            </div>
+        </div>
+
+        <!-- Right: Speed gauge -->
+        <div class="gauge-container">
+            <canvas class="gauge-canvas" id="speed-canvas"></canvas>
+            <div class="gauge-center">
+                <div class="gauge-value" id="speed-value">0</div>
+                <div class="gauge-unit">km/h</div>
+                <div class="gauge-label">车速</div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Bottom strip -->
+    <div class="bottom-strip">
+        <div class="strip-item">
+            <div class="strip-label">里程</div>
+            <div class="strip-value" id="v-odometer">0 km</div>
+        </div>
+        <div class="strip-item">
+            <div class="strip-label">定速巡航</div>
+            <div class="strip-value" id="v-cruise">关</div>
+        </div>
+        <div class="strip-item">
+            <div class="strip-label">路线</div>
+            <div class="strip-value" id="v-route">-- km</div>
+        </div>
+        <div class="strip-item">
+            <div class="strip-label">卡车</div>
+            <div class="strip-value" id="v-truck">--</div>
+        </div>
+        <div class="strip-item">
+            <div class="strip-label">货物</div>
+            <div class="strip-value" id="v-cargo">--</div>
+        </div>
+        <div class="strip-item">
+            <div class="strip-label">收入</div>
+            <div class="strip-value" id="v-income">--</div>
+        </div>
+    </div>
+
+<script>
+// ═══════════════════════════════════════════════
+//  Gauge Renderer - Circular analog gauges
+// ═══════════════════════════════════════════════
+
+class CircularGauge {
+    constructor(canvasId, opts) {
+        this.canvas = document.getElementById(canvasId);
+        this.ctx = this.canvas.getContext('2d');
+        this.min = opts.min || 0;
+        this.max = opts.max || 100;
+        this.startAngle = opts.startAngle || 135;       // degrees, bottom-left
+        this.endAngle = opts.endAngle || 405;            // degrees, bottom-right
+        this.majorTicks = opts.majorTicks || 10;
+        this.minorTicks = opts.minorTicks || 5;
+        this.color = opts.color || '#ff4400';
+        this.warnAt = opts.warnAt || 0.75;               // fraction of max
+        this.dangerAt = opts.dangerAt || 0.9;
+        this.value = 0;
+        this._setupDPR();
+    }
+
+    _setupDPR() {
+        const dpr = window.devicePixelRatio || 1;
+        const rect = this.canvas.getBoundingClientRect();
+        this.canvas.width = rect.width * dpr;
+        this.canvas.height = rect.height * dpr;
+        this.ctx.scale(dpr, dpr);
+        this.w = rect.width;
+        this.h = rect.height;
+        this.cx = this.w / 2;
+        this.cy = this.h / 2;
+        this.radius = Math.min(this.cx, this.cy) * 0.82;
+    }
+
+    setValue(v) {
+        this.value = Math.max(this.min, Math.min(this.max, v));
+        this._draw();
+    }
+
+    _valToAngle(v) {
+        const frac = (v - this.min) / (this.max - this.min);
+        const startRad = this.startAngle * Math.PI / 180;
+        const endRad = this.endAngle * Math.PI / 180;
+        return startRad + frac * (endRad - startRad);
+    }
+
+    _draw() {
+        const ctx = this.ctx;
+        ctx.clearRect(0, 0, this.w, this.h);
+
+        const r = this.radius;
+        const cx = this.cx;
+        const cy = this.cy;
+
+        // Outer ring background
+        ctx.beginPath();
+        ctx.arc(cx, cy, r, this.startAngle * Math.PI / 180, this.endAngle * Math.PI / 180);
+        ctx.strokeStyle = '#1a1a28';
+        ctx.lineWidth = 10;
+        ctx.lineCap = 'butt';
+        ctx.stroke();
+
+        // Value arc
+        const valAngle = this._valToAngle(this.value);
+        const frac = (this.value - this.min) / (this.max - this.min);
+        let arcColor = this.color;
+        if (frac >= this.dangerAt) arcColor = '#ff1744';
+        else if (frac >= this.warnAt) arcColor = '#ffd600';
+
+        if (this.value > this.min) {
+            ctx.beginPath();
+            ctx.arc(cx, cy, r, this.startAngle * Math.PI / 180, valAngle);
+            ctx.strokeStyle = arcColor;
+            ctx.lineWidth = 10;
+            ctx.lineCap = 'round';
+            ctx.stroke();
+
+            // Glow
+            ctx.beginPath();
+            ctx.arc(cx, cy, r, this.startAngle * Math.PI / 180, valAngle);
+            ctx.strokeStyle = arcColor.replace(')', ',0.3)').replace('rgb', 'rgba').replace('#', '');
+            // Simple glow via shadow
+            ctx.shadowColor = arcColor;
+            ctx.shadowBlur = 16;
+            ctx.lineWidth = 4;
+            ctx.stroke();
+            ctx.shadowBlur = 0;
+        }
+
+        // Tick marks
+        const totalMajor = this.majorTicks;
+        const totalMinor = this.majorTicks * this.minorTicks;
+        for (let i = 0; i <= totalMinor; i++) {
+            const frac = i / totalMinor;
+            const angle = (this.startAngle + frac * (this.endAngle - this.startAngle)) * Math.PI / 180;
+            const isMajor = (i % this.minorTicks === 0);
+            const innerR = r - (isMajor ? 22 : 16);
+            const outerR = r - 12;
+
+            ctx.beginPath();
+            ctx.moveTo(cx + innerR * Math.cos(angle), cy + innerR * Math.sin(angle));
+            ctx.lineTo(cx + outerR * Math.cos(angle), cy + outerR * Math.sin(angle));
+            ctx.strokeStyle = isMajor ? '#6e6e8a' : '#3a3a52';
+            ctx.lineWidth = isMajor ? 2 : 1;
+            ctx.stroke();
+
+            // Labels on major ticks
+            if (isMajor) {
+                const labelR = r - 32;
+                const val = this.min + frac * (this.max - this.min);
+                const label = Math.round(val);
+                ctx.fillStyle = '#6e6e8a';
+                ctx.font = '11px Consolas, monospace';
+                ctx.textAlign = 'center';
+                ctx.textBaseline = 'middle';
+                ctx.fillText(label, cx + labelR * Math.cos(angle), cy + labelR * Math.sin(angle));
+            }
+        }
+
+        // Needle
+        const needleAngle = valAngle;
+        const needleLen = r - 8;
+        const tailLen = 16;
+
+        ctx.beginPath();
+        ctx.moveTo(
+            cx - tailLen * Math.cos(needleAngle),
+            cy - tailLen * Math.sin(needleAngle)
+        );
+        ctx.lineTo(
+            cx + needleLen * Math.cos(needleAngle),
+            cy + needleLen * Math.sin(needleAngle)
+        );
+        ctx.strokeStyle = arcColor;
+        ctx.lineWidth = 2.5;
+        ctx.lineCap = 'round';
+        ctx.shadowColor = arcColor;
+        ctx.shadowBlur = 8;
+        ctx.stroke();
+        ctx.shadowBlur = 0;
+
+        // Center dot
+        ctx.beginPath();
+        ctx.arc(cx, cy, 5, 0, Math.PI * 2);
+        ctx.fillStyle = arcColor;
+        ctx.fill();
+    }
+}
+
+// ═══════════════════════════════════════════════
+//  Data fetching & UI update
+// ═══════════════════════════════════════════════
+
+const rpmGauge = new CircularGauge('rpm-canvas', {
+    min: 0, max: 7000,
+    majorTicks: 7, minorTicks: 5,
+    color: '#ff4400',
+    warnAt: 0.72, dangerAt: 0.88
+});
+
+const speedGauge = new CircularGauge('speed-canvas', {
+    min: 0, max: 160,
+    majorTicks: 8, minorTicks: 5,
+    color: '#00e676',
+    warnAt: 0.8, dangerAt: 0.95
+});
+
+let lastData = null;
+
+async function fetchTelemetry() {
+    try {
+        const res = await fetch('/plugin/trigger', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                plugin_id: 'scs_telemetry',
+                entry_id: 'get_telemetry',
+                args: {}
+            })
+        });
+        const json = await res.json();
+        return json.ok ? json.data?.data : null;
+    } catch {
+        return null;
+    }
+}
+
+function gameMinutesToTime(minutes) {
+    const h = Math.floor(minutes / 60) % 24;
+    const m = Math.floor(minutes % 60);
+    return `${String(h).padStart(2, '0')}:${String(m).padStart(2, '0')}`;
+}
+
+function formatNumber(n, decimals) {
+    if (n == null || isNaN(n)) return '--';
+    return Number(n).toFixed(decimals);
+}
+
+function warnEl(id, active, cls) {
+    const el = document.getElementById(id);
+    if (!el) return;
+    el.classList.toggle('active', !!active);
+    if (cls) {
+        el.classList.remove('red', 'yellow', 'green', 'blue');
+        if (active) el.classList.add(cls);
+    }
+}
+
+function damageClass(pct) {
+    if (pct > 0.5) return 'high';
+    if (pct > 0.2) return 'mid';
+    return '';
+}
+
+function fuelClass(pct) {
+    if (pct < 0.15) return 'critical';
+    if (pct < 0.30) return 'low';
+    return '';
+}
+
+function updateUI(data) {
+    if (!data || !data.sdk_active) {
+        document.getElementById('conn-dot').classList.remove('online');
+        document.getElementById('game-name').textContent = '--';
+        rpmGauge.setValue(0);
+        speedGauge.setValue(0);
+        document.getElementById('rpm-value').textContent = '0';
+        document.getElementById('speed-value').textContent = '0';
+        return;
+    }
+
+    document.getElementById('conn-dot').classList.add('online');
+
+    const truck = data.truck || {};
+    const dash = truck.dashboard || {};
+    const gears = truck.gears || {};
+    const engine = truck.engine || {};
+    const brakes = truck.brakes || {};
+    const lights = truck.lights || {};
+    const fuel = dash.fuel || {};
+    const temp = dash.temperature || {};
+    const pressure = dash.pressure || {};
+    const damage = truck.damage || {};
+    const nav = data.navigation || {};
+    const job = data.job || {};
+    const common = data.common || {};
+    const identity = truck.identity || {};
+
+    // RPM gauge
+    const rpm = dash.rpm || 0;
+    const rpmMax = engine.rpm_max || 2500;
+    rpmGauge.max = rpmMax;
+    rpmGauge.warnAt = 0.72;
+    rpmGauge.dangerAt = 0.88;
+    rpmGauge.setValue(rpm);
+    document.getElementById('rpm-value').textContent = Math.round(rpm);
+
+    // Speed gauge (SCS speed is m/s, convert to km/h)
+    const speedMs = dash.speed || 0;
+    const speedKmh = speedMs * 3.6;
+    speedGauge.setValue(speedKmh);
+    document.getElementById('speed-value').textContent = Math.round(speedKmh);
+
+    // Game info
+    const version = data.version || {};
+    document.getElementById('game-name').textContent = version.game || '--';
+    document.getElementById('game-time').textContent = common.game_time_minutes
+        ? gameMinutesToTime(common.game_time_minutes)
+        : '--:--';
+
+    // Gear
+    const gearCurrent = gears.current || 0;
+    const gearDash = gears.dashboard || 0;
+    const gearDisplay = gearDash === 0 ? '空' : gearDash > 0 ? `D${gearDash}` : `R${Math.abs(gearDash)}`;
+    document.getElementById('gear-letter').textContent = gearDisplay;
+    document.getElementById('gear-sub').textContent =
+        `${gears.forward_count || '?'}前 / ${gears.reverse_count || '?'}倒`;
+
+    // Info grid
+    document.getElementById('v-speed').textContent = `${speedKmh.toFixed(0)} km/h`;
+
+    const limitMs = nav.speed_limit || 0;
+    document.getElementById('v-limit').textContent = limitMs > 0 ? `${(limitMs * 3.6).toFixed(0)} km/h` : '--';
+
+    document.getElementById('v-water').textContent = `${formatNumber(temp.water, 0)} \u00B0C`;
+    const waterEl = document.getElementById('v-water');
+    waterEl.className = 'info-val' + (temp.water > 100 ? ' danger' : temp.water > 90 ? ' warn' : '');
+
+    document.getElementById('v-oil-temp').textContent = `${formatNumber(temp.oil, 0)} \u00B0C`;
+    document.getElementById('v-air').textContent = `${formatNumber(pressure.air, 1)} bar`;
+    const airEl = document.getElementById('v-air');
+    airEl.className = 'info-val' + (pressure.air > 0 && pressure.air < 0.6 ? ' danger' : '');
+
+    document.getElementById('v-oil-press').textContent = `${formatNumber(pressure.oil, 1)} bar`;
+    document.getElementById('v-battery').textContent = `${formatNumber(dash.battery_voltage, 1)} V`;
+    document.getElementById('v-retarder').textContent = gears.retarder_brake || 0;
+
+    // Fuel
+    const fuelAmount = fuel.amount || 0;
+    const fuelCap = fuel.capacity || 1;
+    const fuelPct = fuelCap > 0 ? fuelAmount / fuelCap : 0;
+    document.getElementById('fuel-fill').style.width = `${(fuelPct * 100).toFixed(1)}%`;
+    document.getElementById('fuel-fill').className = 'fuel-bar-fill ' + fuelClass(fuelPct);
+    document.getElementById('fuel-text').textContent = `${fuelAmount.toFixed(0)} L / ${fuelCap.toFixed(0)} L`;
+
+    // Warning lights
+    warnEl('w-park', brakes.parking, 'yellow');
+    warnEl('w-fuel', dash.fuel && fuelPct < (fuel.warning_factor || 0.25), 'red');
+    warnEl('w-air', brakes.air_pressure_warning, 'red');
+    warnEl('w-oil', dash.pressure && pressure.oil > 0 && pressure.oil < 40, 'red');
+    warnEl('w-water', temp.water > 100, 'yellow');
+    warnEl('w-battery', dash.battery_voltage > 0 && dash.battery_voltage < 22, 'yellow');
+    warnEl('w-cruise', truck.cruise_control, 'green');
+    warnEl('w-engine', engine.enabled, 'green');
+    warnEl('w-left', lights.blinker_left, 'blue');
+    warnEl('w-right', lights.blinker_right, 'blue');
+    warnEl('w-beacon', lights.beacon, 'yellow');
+    warnEl('w-hazard', lights.hazard, 'red');
+
+    // Damage
+    const setDmg = (id, val) => {
+        const el = document.getElementById(id);
+        if (!el) return;
+        const pct = Math.max(0, Math.min(1, val || 0));
+        el.style.width = `${(pct * 100).toFixed(1)}%`;
+        el.className = 'damage-fill ' + damageClass(pct);
+    };
+    setDmg('dmg-engine', damage.engine);
+    setDmg('dmg-trans', damage.transmission);
+    setDmg('dmg-cabin', damage.cabin);
+    setDmg('dmg-chassis', damage.chassis);
+    setDmg('dmg-wheels', damage.wheels);
+
+    // Bottom strip
+    document.getElementById('v-odometer').textContent = `${(dash.odometer || 0).toFixed(1)} km`;
+    document.getElementById('v-cruise').textContent = truck.cruise_control
+        ? `${(dash.cruise_control_speed * 3.6).toFixed(0)} km/h`
+        : '关';
+
+    const routeDist = nav.route_distance || 0;
+    document.getElementById('v-route').textContent = routeDist > 0 ? `${routeDist.toFixed(0)} km` : '--';
+
+    document.getElementById('v-truck').textContent = identity.name || identity.brand || '--';
+
+    // Job
+    const jobPanel = document.getElementById('job-panel');
+    if (job.on_job) {
+        jobPanel.classList.add('active');
+        const cargo = job.cargo || {};
+        const dest = job.destination || {};
+        document.getElementById('job-text').textContent =
+            `${cargo.name || '??'} \u2192 ${dest.city || '??'} | ${(cargo.mass || 0).toFixed(1)}t | \u00A5${((job.income || 0) / 100).toLocaleString()}`;
+        document.getElementById('v-cargo').textContent = cargo.name || '--';
+        document.getElementById('v-income').textContent = job.income ? `\u00A5${(job.income / 100).toLocaleString()}` : '--';
+    } else {
+        jobPanel.classList.remove('active');
+        document.getElementById('v-cargo').textContent = '--';
+        document.getElementById('v-income').textContent = '--';
+    }
+}
+
+// ═══════════════════════════════════════════════
+//  Main loop
+// ═══════════════════════════════════════════════
+
+let refreshing = false;
+
+async function tick() {
+    if (refreshing) return;
+    refreshing = true;
+    try {
+        const data = await fetchTelemetry();
+        updateUI(data);
+    } catch (e) {
+        console.error('遥测更新失败:', e);
+    }
+    refreshing = false;
+}
+
+// Initial draw
+rpmGauge.setValue(0);
+speedGauge.setValue(0);
+
+// Poll at ~10 FPS for smooth gauges
+setInterval(tick, 100);
+
+// Handle resize
+window.addEventListener('resize', () => {
+    rpmGauge._setupDPR();
+    speedGauge._setupDPR();
+    rpmGauge.setValue(rpmGauge.value);
+    speedGauge.setValue(speedGauge.value);
+});
+</script>
+
+</body>
+</html>
