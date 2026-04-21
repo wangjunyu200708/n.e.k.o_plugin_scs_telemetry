@@ -4,6 +4,7 @@ from plugin.sdk.plugin import (
 )
 from typing import Any, Optional
 import asyncio
+import time
 from .scs_telemetry import SCSTelemetryReader
 
 
@@ -26,6 +27,8 @@ class SCSTelemetryPlugin(NekoPluginBase):
         self.logger = get_plugin_logger(__name__)
         self.telemetry_reader = None
         self._last_alert_state = {}  # 记录上一次推送的状态，用于变化检测
+        self._cached_data = None      # 最新遥测数据缓存
+        self._cache_time = 0          # 缓存时间戳
 
     @lifecycle(id="startup")
     async def on_startup(self, **_):
@@ -65,9 +68,9 @@ class SCSTelemetryPlugin(NekoPluginBase):
             self.telemetry_reader.close()
         return Ok({"status": "stopped"})
 
-    @timer_interval(id="telemetry_poll", seconds=1, auto_start=True)
+    @timer_interval(id="telemetry_poll", seconds=0.5, auto_start=True)
     async def _poll_telemetry(self, **_):
-        """定时轮询遥测数据，仅在状态突变时推送警报"""
+        """定时轮询遥测数据，更新缓存并检测状态突变"""
         # 如果读取器未初始化，尝试重新初始化
         if not self.telemetry_reader:
             try:
@@ -78,18 +81,30 @@ class SCSTelemetryPlugin(NekoPluginBase):
 
         try:
             data = await asyncio.to_thread(self.telemetry_reader.read_data)
-            if not data:
-                return
+            if data:
+                self._cached_data = data
+                self._cache_time = time.monotonic()
+                # ── 状态变化检测 ──
+                self._check_and_alert(data)
+            else:
+                self.logger.debug("read_data() 返回 None（sdkActive=False 或游戏暂停）")
 
-            # ── 状态变化检测 ──
-            self._check_and_alert(data)
-
+        except AttributeError as e:
+            # 结构体字段访问错误——代码 bug，不应重置连接
+            self.logger.error(f"结构体字段错误（代码问题）: {e}")
+        except OSError as e:
+            # access violation 等内存访问错误
+            self.logger.error(f"内存访问错误（指针截断?）: {e}, map_view={self.telemetry_reader._map_view}")
+            self.telemetry_reader.close()
+            self.telemetry_reader = None
+            self._cached_data = None
         except Exception as e:
-            self.logger.error(f"采集遥测数据失败: {e}")
+            self.logger.error(f"采集遥测数据失败: {type(e).__name__}: {e}")
             # 读取失败可能是游戏关闭了，释放读取器等待重连
             if self.telemetry_reader:
                 self.telemetry_reader.close()
                 self.telemetry_reader = None
+            self._cached_data = None
 
 
 
@@ -218,7 +233,7 @@ class SCSTelemetryPlugin(NekoPluginBase):
             alerts.append("🔑 发动机已熄火")
 
         # ═══════════════════════════════════════════
-        #  10. 任务状态变化（含卡车信息+赞叹）
+        #  10. 任务状态变化
         # ═══════════════════════════════════════════
         on_job = job.get("on_job", False)
         was_on_job = last.get("on_job", False)
@@ -241,11 +256,16 @@ class SCSTelemetryPlugin(NekoPluginBase):
             msg += f"\n📏 距离: {distance:.0f} km"
             msg += f"\n💰 预计收入: ¥{income:,.0f}"
             alerts.append(msg)
-        elif not on_job and was_on_job:
-            if job.get("job_delivered"):
-                alerts.append("📋 任务已交付！辛苦了！")
-            elif job.get("job_cancelled"):
-                alerts.append("📋 任务已取消")
+
+        # 10b. 任务交付/取消——独立监听脉冲信号，不等 on_job 变 False
+        job_delivered = job.get("job_delivered", False)
+        job_cancelled = job.get("job_cancelled", False)
+        was_delivered = last.get("job_delivered", False)
+        was_cancelled = last.get("job_cancelled", False)
+        if job_delivered and not was_delivered:
+            alerts.append("📋 任务已交付！辛苦了！")
+        if job_cancelled and not was_cancelled:
+            alerts.append("📋 任务已取消")
 
         # ═══════════════════════════════════════════
         #  11. 罚款事件
@@ -283,6 +303,8 @@ class SCSTelemetryPlugin(NekoPluginBase):
             "oil_press_warning": is_oil_press_warn,
             "engine_on": engine_on,
             "on_job": on_job,
+            "job_delivered": job_delivered,
+            "job_cancelled": job_cancelled,
             "fined": fined,
             "near_destination": is_near_dest,
         }
@@ -307,18 +329,14 @@ class SCSTelemetryPlugin(NekoPluginBase):
         }
     )
     async def get_telemetry(self, **_):
-        """获取当前完整遥测数据"""
+        """获取当前完整遥测数据（直接返回缓存，无阻塞）"""
         if not self.telemetry_reader:
             return Err(SdkError("遥测读取器未初始化，游戏可能未运行"))
-        try:
-            data = await asyncio.to_thread(self.telemetry_reader.read_data)
-            if data:
-                return Ok({"data": data})
-            else:
-                return Err(SdkError("未获取到遥测数据（SDK 未激活或游戏暂停）"))
-        except Exception as e:
-            self.logger.error(f"获取遥测数据失败: {e}")
-            return Err(SdkError(f"获取失败: {e}"))
+        data = self._cached_data
+        if data:
+            return Ok({"data": data})
+        else:
+            return Err(SdkError("未获取到遥测数据（SDK 未激活或游戏暂停）"))
 
     @plugin_entry(
         id="get_truck_status",
@@ -330,75 +348,71 @@ class SCSTelemetryPlugin(NekoPluginBase):
         }
     )
     async def get_truck_status(self, **_):
-        """获取车辆关键状态摘要"""
+        """获取车辆关键状态摘要（直接返回缓存）"""
         if not self.telemetry_reader:
             return Err(SdkError("遥测读取器未初始化，游戏可能未运行"))
-        try:
-            data = await asyncio.to_thread(self.telemetry_reader.read_data)
-            if not data:
-                return Err(SdkError("未获取到车辆状态数据"))
+        data = self._cached_data
+        if not data:
+            return Err(SdkError("未获取到车辆状态数据"))
 
-            truck = data.get("truck", {})
-            dashboard = truck.get("dashboard", {})
-            status = {
-                "speed": dashboard.get("speed", 0),
-                "rpm": dashboard.get("rpm", 0),
-                "fuel": {
-                    "amount": dashboard.get("fuel", {}).get("amount", 0),
-                    "capacity": dashboard.get("fuel", {}).get("capacity", 0),
-                    "consumption": dashboard.get("fuel", {}).get("average_consumption", 0),
-                    "range": dashboard.get("fuel", {}).get("range", 0),
-                },
-                "temperature": {
-                    "water": dashboard.get("temperature", {}).get("water", 0),
-                    "oil": dashboard.get("temperature", {}).get("oil", 0),
-                },
-                "pressure": {
-                    "oil": dashboard.get("pressure", {}).get("oil", 0),
-                    "air": dashboard.get("pressure", {}).get("air", 0),
-                },
-                "battery_voltage": dashboard.get("battery_voltage", 0),
-                "odometer": dashboard.get("odometer", 0),
-                "cruise_control_speed": dashboard.get("cruise_control_speed", 0),
-                "engine": {
-                    "enabled": truck.get("engine", {}).get("enabled", False),
-                    "electric": truck.get("engine", {}).get("electric", False),
-                },
-                "gears": {
-                    "current": truck.get("gears", {}).get("current", 0),
-                    "dashboard": truck.get("gears", {}).get("dashboard", 0),
-                    "shifter_slot": truck.get("gears", {}).get("shifter_slot", 0),
-                },
-                "brakes": {
-                    "parking": truck.get("brakes", {}).get("parking", False),
-                    "motor_brake": truck.get("brakes", {}).get("motor_brake", False),
-                    "air_pressure_warning": truck.get("brakes", {}).get("air_pressure_warning", False),
-                    "air_pressure_emergency": truck.get("brakes", {}).get("air_pressure_emergency", False),
-                },
-                "lights": {
-                    "parking": truck.get("lights", {}).get("parking", False),
-                    "beam_low": truck.get("lights", {}).get("beam_low", False),
-                    "beam_high": truck.get("lights", {}).get("beam_high", False),
-                    "brake": truck.get("lights", {}).get("brake", False),
-                    "reverse": truck.get("lights", {}).get("reverse", False),
-                    "hazard": truck.get("lights", {}).get("hazard", False),
-                    "blinker_left": truck.get("lights", {}).get("blinker_left", False),
-                    "blinker_right": truck.get("lights", {}).get("blinker_right", False),
-                },
-                "damage": {
-                    "engine": truck.get("damage", {}).get("engine", 0),
-                    "transmission": truck.get("damage", {}).get("transmission", 0),
-                    "cabin": truck.get("damage", {}).get("cabin", 0),
-                    "chassis": truck.get("damage", {}).get("chassis", 0),
-                    "wheels": truck.get("damage", {}).get("wheels", 0),
-                },
-                "identity": truck.get("identity", {}),
-                "position": truck.get("position", {}),
-            }
-            return Ok({"status": status})
-        except Exception as e:
-            self.logger.error(f"获取车辆状态失败: {e}")
-            return Err(SdkError(f"获取失败: {e}"))
+        truck = data.get("truck", {})
+        dashboard = truck.get("dashboard", {})
+        status = {
+            "speed": dashboard.get("speed", 0),
+            "rpm": dashboard.get("rpm", 0),
+            "fuel": {
+                "amount": dashboard.get("fuel", {}).get("amount", 0),
+                "capacity": dashboard.get("fuel", {}).get("capacity", 0),
+                "consumption": dashboard.get("fuel", {}).get("average_consumption", 0),
+                "range": dashboard.get("fuel", {}).get("range", 0),
+            },
+            "temperature": {
+                "water": dashboard.get("temperature", {}).get("water", 0),
+                "oil": dashboard.get("temperature", {}).get("oil", 0),
+            },
+            "pressure": {
+                "oil": dashboard.get("pressure", {}).get("oil", 0),
+                "air": dashboard.get("pressure", {}).get("air", 0),
+            },
+            "battery_voltage": dashboard.get("battery_voltage", 0),
+            "odometer": dashboard.get("odometer", 0),
+            "cruise_control_speed": dashboard.get("cruise_control_speed", 0),
+            "engine": {
+                "enabled": truck.get("engine", {}).get("enabled", False),
+                "electric": truck.get("engine", {}).get("electric", False),
+            },
+            "gears": {
+                "current": truck.get("gears", {}).get("current", 0),
+                "dashboard": truck.get("gears", {}).get("dashboard", 0),
+                "shifter_slot": truck.get("gears", {}).get("shifter_slot", 0),
+            },
+            "brakes": {
+                "parking": truck.get("brakes", {}).get("parking", False),
+                "motor_brake": truck.get("brakes", {}).get("motor_brake", False),
+                "air_pressure_warning": truck.get("brakes", {}).get("air_pressure_warning", False),
+                "air_pressure_emergency": truck.get("brakes", {}).get("air_pressure_emergency", False),
+            },
+            "lights": {
+                "parking": truck.get("lights", {}).get("parking", False),
+                "beam_low": truck.get("lights", {}).get("beam_low", False),
+                "beam_high": truck.get("lights", {}).get("beam_high", False),
+                "brake": truck.get("lights", {}).get("brake", False),
+                "reverse": truck.get("lights", {}).get("reverse", False),
+                "hazard": truck.get("lights", {}).get("hazard", False),
+                "blinker_left": truck.get("lights", {}).get("blinker_left", False),
+                "blinker_right": truck.get("lights", {}).get("blinker_right", False),
+            },
+            "damage": {
+                "engine": truck.get("damage", {}).get("engine", 0),
+                "transmission": truck.get("damage", {}).get("transmission", 0),
+                "cabin": truck.get("damage", {}).get("cabin", 0),
+                "chassis": truck.get("damage", {}).get("chassis", 0),
+                "wheels": truck.get("damage", {}).get("wheels", 0),
+            },
+            "identity": truck.get("identity", {}),
+            "position": truck.get("position", {}),
+        }
+        return Ok({"status": status})
 
     @plugin_entry(
         id="get_navigation",
@@ -410,39 +424,35 @@ class SCSTelemetryPlugin(NekoPluginBase):
         }
     )
     async def get_navigation(self, **_):
-        """获取导航信息"""
+        """获取导航信息（直接返回缓存）"""
         if not self.telemetry_reader:
             return Err(SdkError("遥测读取器未初始化，游戏可能未运行"))
-        try:
-            data = await asyncio.to_thread(self.telemetry_reader.read_data)
-            if not data:
-                return Err(SdkError("未获取到导航数据"))
+        data = self._cached_data
+        if not data:
+            return Err(SdkError("未获取到导航数据"))
 
-            nav = data.get("navigation", {})
-            dashboard = data.get("truck", {}).get("dashboard", {})
-            job = data.get("job", {})
+        nav = data.get("navigation", {})
+        dashboard = data.get("truck", {}).get("dashboard", {})
+        job = data.get("job", {})
 
-            speed_ms = dashboard.get("speed", 0)
-            speed_kmh = speed_ms * 3.6
-            limit_ms = nav.get("speed_limit", 0)
-            limit_kmh = limit_ms * 3.6 if limit_ms > 0 else 0
-            route_dist_m = nav.get("route_distance", 0)
-            route_dist_km = route_dist_m / 1000 if route_dist_m > 0 else 0
-            route_time_s = nav.get("route_time", 0)
-            route_time_min = route_time_s / 60 if route_time_s > 0 else 0
+        speed_ms = dashboard.get("speed", 0)
+        speed_kmh = speed_ms * 3.6
+        limit_ms = nav.get("speed_limit", 0)
+        limit_kmh = limit_ms * 3.6 if limit_ms > 0 else 0
+        route_dist_m = nav.get("route_distance", 0)
+        route_dist_km = route_dist_m / 1000 if route_dist_m > 0 else 0
+        route_time_s = nav.get("route_time", 0)
+        route_time_min = route_time_s / 60 if route_time_s > 0 else 0
 
-            is_speeding = limit_kmh > 0 and speed_kmh > (limit_kmh + self._SPEED_LIMIT_TOLERANCE)
+        is_speeding = limit_kmh > 0 and speed_kmh > (limit_kmh + self._SPEED_LIMIT_TOLERANCE)
 
-            result = {
-                "speed_kmh": round(speed_kmh, 1),
-                "speed_limit_kmh": round(limit_kmh, 1) if limit_kmh > 0 else None,
-                "is_speeding": is_speeding,
-                "route_distance_km": round(route_dist_km, 1),
-                "route_time_minutes": round(route_time_min, 1),
-                "on_job": job.get("on_job", False),
-                "destination": job.get("destination", {}).get("city", "") if job.get("on_job") else None,
-            }
-            return Ok({"navigation": result})
-        except Exception as e:
-            self.logger.error(f"获取导航信息失败: {e}")
-            return Err(SdkError(f"获取失败: {e}"))
+        result = {
+            "speed_kmh": round(speed_kmh, 1),
+            "speed_limit_kmh": round(limit_kmh, 1) if limit_kmh > 0 else None,
+            "is_speeding": is_speeding,
+            "route_distance_km": round(route_dist_km, 1),
+            "route_time_minutes": round(route_time_min, 1),
+            "on_job": job.get("on_job", False),
+            "destination": job.get("destination", {}).get("city", "") if job.get("on_job") else None,
+        }
+        return Ok({"navigation": result})

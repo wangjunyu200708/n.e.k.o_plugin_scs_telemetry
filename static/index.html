@@ -679,7 +679,14 @@ const speedGauge = new CircularGauge('speed-canvas', {
 
 let lastData = null;
 
+let fetchAbortCtrl = null;
+
 async function fetchTelemetry() {
+    // 取消上一个未完成的请求，防止堆积
+    if (fetchAbortCtrl) fetchAbortCtrl.abort();
+    fetchAbortCtrl = new AbortController();
+    const timeout = setTimeout(() => fetchAbortCtrl.abort(), 3000);
+
     try {
         const res = await fetch('/plugin/trigger', {
             method: 'POST',
@@ -688,12 +695,17 @@ async function fetchTelemetry() {
                 plugin_id: 'scs_telemetry',
                 entry_id: 'get_telemetry',
                 args: {}
-            })
+            }),
+            signal: fetchAbortCtrl.signal
         });
+        clearTimeout(timeout);
         const json = await res.json();
         return json.ok ? json.data?.data : null;
     } catch {
         return null;
+    } finally {
+        clearTimeout(timeout);
+        fetchAbortCtrl = null;
     }
 }
 
@@ -893,8 +905,8 @@ async function tick() {
 rpmGauge.setValue(0);
 speedGauge.setValue(0);
 
-// Poll at ~10 FPS for smooth gauges
-setInterval(tick, 100);
+// Poll at ~2 Hz（游戏遥测更新约 10-20Hz，2Hz 轮询足以流畅）
+setInterval(tick, 500);
 
 // Handle resize
 window.addEventListener('resize', () => {
