@@ -5,7 +5,26 @@ from plugin.sdk.plugin import (
 from typing import Any, Optional
 import asyncio
 import time
+import os
+import datetime
 from .scs_telemetry import SCSTelemetryReader
+
+# 文件日志——不依赖 get_plugin_logger，直接写 data 目录
+_FLOG_PATH = None
+
+def _flog(msg: str):
+    """写文件日志到 data/scs_debug.log"""
+    global _FLOG_PATH
+    try:
+        if _FLOG_PATH is None:
+            # 延迟确定路径——在 startup 之后 config_dir 才可用
+            return
+        ts = datetime.datetime.now().strftime("%H:%M:%S.%f")[:-3]
+        line = f"{ts} {msg}\n"
+        with open(_FLOG_PATH, "a", encoding="utf-8") as f:
+            f.write(line)
+    except Exception:
+        pass
 
 
 @neko_plugin
@@ -33,13 +52,34 @@ class SCSTelemetryPlugin(NekoPluginBase):
     @lifecycle(id="startup")
     async def on_startup(self, **_):
         """插件启动"""
+        # 初始化文件日志路径
+        global _FLOG_PATH
+        _FLOG_PATH = str(self.config_dir / "scs_debug.log")
+        _flog("========== SCS 插件启动 ==========")
+        _flog(f"config_dir = {self.config_dir}")
+        _flog(f"Python: {os.sys.executable}, {os.sys.version}")
+        _flog(f"PID: {os.getpid()}")
+
         self.logger.info("SCS 遥测插件启动中...")
 
         # 初始化遥测读取器
         try:
             self.telemetry_reader = SCSTelemetryReader()
+            _flog(f"Reader 初始化成功: view={hex(self.telemetry_reader._map_view)}, handle={hex(self.telemetry_reader._map_handle)}")
             self.logger.info("✅ SCS 遥测读取器初始化成功")
+            # 立即读一次，填充缓存
+            try:
+                data = await asyncio.to_thread(self.telemetry_reader.read_data)
+                if data:
+                    self._cached_data = data
+                    self._cache_time = time.monotonic()
+                    _flog(f"startup read_data OK: sdk={data.get('sdk_active')}, speed={data.get('truck',{}).get('dashboard',{}).get('speed',0)}")
+                else:
+                    _flog("startup read_data returned None")
+            except Exception as e:
+                _flog(f"startup read_data failed: {type(e).__name__}: {e}")
         except Exception as e:
+            _flog(f"Reader 初始化失败: {type(e).__name__}: {e}")
             self.logger.warning(f"⚠️ 初始化遥测读取器失败: {e}（游戏未启动？插件启动后会自动重试）")
             # 不阻止插件启动，timer_interval 里会重试
 
@@ -57,7 +97,8 @@ class SCSTelemetryPlugin(NekoPluginBase):
 
         return Ok({
             "status": "ready",
-            "message": "SCS 遥测插件已启动"
+            "message": "SCS 遥测插件已启动",
+            "cached_data_available": self._cached_data is not None
         })
 
     @lifecycle(id="shutdown")
@@ -75,8 +116,10 @@ class SCSTelemetryPlugin(NekoPluginBase):
         if not self.telemetry_reader:
             try:
                 self.telemetry_reader = SCSTelemetryReader()
+                _flog(f"Reader 重连成功: view={hex(self.telemetry_reader._map_view)}")
                 self.logger.info("✅ 遥测读取器重新连接成功")
-            except Exception:
+            except Exception as e:
+                _flog(f"Reader 重连失败: {type(e).__name__}: {e}")
                 return  # 游戏还没启动，静默等待
 
         try:
@@ -84,21 +127,23 @@ class SCSTelemetryPlugin(NekoPluginBase):
             if data:
                 self._cached_data = data
                 self._cache_time = time.monotonic()
+                _flog(f"poll OK: sdk={data.get('sdk_active')}, speed={data.get('truck',{}).get('dashboard',{}).get('speed',0)}")
                 # ── 状态变化检测 ──
                 self._check_and_alert(data)
             else:
-                self.logger.debug("read_data() 返回 None（sdkActive=False 或游戏暂停）")
+                _flog("poll: read_data() 返回 None")
 
         except AttributeError as e:
-            # 结构体字段访问错误——代码 bug，不应重置连接
+            _flog(f"poll AttributeError: {e}")
             self.logger.error(f"结构体字段错误（代码问题）: {e}")
         except OSError as e:
-            # access violation 等内存访问错误
+            _flog(f"poll OSError（指针截断?）: {e}, view={self.telemetry_reader._map_view}")
             self.logger.error(f"内存访问错误（指针截断?）: {e}, map_view={self.telemetry_reader._map_view}")
             self.telemetry_reader.close()
             self.telemetry_reader = None
             self._cached_data = None
         except Exception as e:
+            _flog(f"poll Exception: {type(e).__name__}: {e}")
             self.logger.error(f"采集遥测数据失败: {type(e).__name__}: {e}")
             # 读取失败可能是游戏关闭了，释放读取器等待重连
             if self.telemetry_reader:
@@ -125,7 +170,7 @@ class SCSTelemetryPlugin(NekoPluginBase):
         pressure = dashboard.get("pressure", {})
 
         # ═══════════════════════════════════════════
-        #  1. 超速判断
+        #  1. 超速判断（仅变化时推送）
         # ═══════════════════════════════════════════
         speed_ms = dashboard.get("speed", 0)
         speed_kmh = speed_ms * 3.6
@@ -290,6 +335,27 @@ class SCSTelemetryPlugin(NekoPluginBase):
             pass  # 离开近距范围不报
 
         # ═══════════════════════════════════════════
+        #  13. 定时播报剩余路程（每 3 分钟，任务中）
+        # ═══════════════════════════════════════════
+        now = time.monotonic()
+        last_route_report = last.get("last_route_report_time", 0)
+        route_dist = nav.get("route_distance", 0)
+        route_time = nav.get("route_time", 0)
+        if on_job and route_dist > 0 and (now - last_route_report) >= self._ROUTE_REPORT_SEC:
+            route_dist_km = route_dist / 1000
+            route_time_min = route_time / 60 if route_time > 0 else 0
+            dst_city = job.get("destination", {}).get("city", "目的地")
+            msg = f"🗺️ 路程播报：距 {dst_city} 还有 {route_dist_km:.0f} km"
+            if route_time_min > 0:
+                route_time_h = int(route_time_min // 60)
+                route_time_m = int(route_time_min % 60)
+                if route_time_h > 0:
+                    msg += f"，预计 {route_time_h}小时{route_time_m}分钟"
+                else:
+                    msg += f"，预计 {route_time_m} 分钟"
+            alerts.append(msg)
+
+        # ═══════════════════════════════════════════
         #  更新状态快照
         # ═══════════════════════════════════════════
         self._last_alert_state = {
@@ -307,17 +373,44 @@ class SCSTelemetryPlugin(NekoPluginBase):
             "job_cancelled": job_cancelled,
             "fined": fined,
             "near_destination": is_near_dest,
+            "last_route_report_time": now if (on_job and route_dist > 0 and (now - last_route_report) >= self._ROUTE_REPORT_SEC) else last_route_report,
         }
 
-        # 推送所有触发的警报
+        # 推送所有触发的警报（必须用 proactive_notification 才能被主进程转发给 AI）
         for alert_msg in alerts:
             self.push_message(
                 source="scs_telemetry",
-                message_type="text",
+                message_type="proactive_notification",
                 description="SCS 状态警报",
                 priority=2,
                 content=alert_msg,
             )
+
+    # ── 缓存与推送常量 ──
+    _CACHE_STALE_SEC = 2.0        # 缓存超过 2 秒视为过期
+    _ROUTE_REPORT_SEC = 180.0     # 每 3 分钟播报剩余路程
+
+    async def _ensure_fresh(self):
+        """确保缓存未过期，过期则刷新。返回 True 表示有可用数据"""
+        if not self.telemetry_reader:
+            try:
+                self.telemetry_reader = SCSTelemetryReader()
+            except Exception:
+                return False
+        stale = (time.monotonic() - self._cache_time) > self._CACHE_STALE_SEC
+        if stale or self._cached_data is None:
+            try:
+                data = await asyncio.to_thread(self.telemetry_reader.read_data)
+                if data:
+                    self._cached_data = data
+                    self._cache_time = time.monotonic()
+                    # 惰性刷新时也检测状态变化
+                    self._check_and_alert(data)
+            except Exception:
+                self.telemetry_reader.close()
+                self.telemetry_reader = None
+                return False
+        return self._cached_data is not None
 
     @plugin_entry(
         id="get_telemetry",
@@ -329,14 +422,10 @@ class SCSTelemetryPlugin(NekoPluginBase):
         }
     )
     async def get_telemetry(self, **_):
-        """获取当前完整遥测数据（直接返回缓存，无阻塞）"""
-        if not self.telemetry_reader:
-            return Err(SdkError("遥测读取器未初始化，游戏可能未运行"))
-        data = self._cached_data
-        if data:
-            return Ok({"data": data})
-        else:
+        """获取当前完整遥测数据（缓存过期时惰性刷新）"""
+        if not await self._ensure_fresh():
             return Err(SdkError("未获取到遥测数据（SDK 未激活或游戏暂停）"))
+        return Ok({"data": self._cached_data})
 
     @plugin_entry(
         id="get_truck_status",
@@ -348,9 +437,9 @@ class SCSTelemetryPlugin(NekoPluginBase):
         }
     )
     async def get_truck_status(self, **_):
-        """获取车辆关键状态摘要（直接返回缓存）"""
-        if not self.telemetry_reader:
-            return Err(SdkError("遥测读取器未初始化，游戏可能未运行"))
+        """获取车辆关键状态摘要（缓存过期时惰性刷新）"""
+        if not await self._ensure_fresh():
+            return Err(SdkError("遥测读取器未初始化或无数据"))
         data = self._cached_data
         if not data:
             return Err(SdkError("未获取到车辆状态数据"))
@@ -424,12 +513,10 @@ class SCSTelemetryPlugin(NekoPluginBase):
         }
     )
     async def get_navigation(self, **_):
-        """获取导航信息（直接返回缓存）"""
-        if not self.telemetry_reader:
-            return Err(SdkError("遥测读取器未初始化，游戏可能未运行"))
+        """获取导航信息（缓存过期时惰性刷新）"""
+        if not await self._ensure_fresh():
+            return Err(SdkError("遥测读取器未初始化或无数据"))
         data = self._cached_data
-        if not data:
-            return Err(SdkError("未获取到导航数据"))
 
         nav = data.get("navigation", {})
         dashboard = data.get("truck", {}).get("dashboard", {})

@@ -1,5 +1,6 @@
 import ctypes
 import struct
+import os
 from typing import Optional, Dict, Any
 
 # ── Windows API 常量 ──
@@ -677,14 +678,25 @@ class SCSTelemetryReader:
 
     def read_data(self) -> Optional[Dict[str, Any]]:
         """读取完整遥测数据，返回字典"""
+        import datetime as _dt
+        def _log(msg):
+            try:
+                with open(os.path.join(os.path.dirname(__file__), "scs_read_debug.log"), "a", encoding="utf-8") as _f:
+                    _f.write(f"{_dt.datetime.now().strftime('%H:%M:%S.%f')[:-3]} {msg}\n")
+            except Exception:
+                pass
+
         if not self._map_view:
+            _log("read_data: _map_view is None")
             return None
 
         try:
             s = self._get_struct()
+            _log(f"struct OK, sdkActive={s.sdkActive}, view={hex(self._map_view)}")
 
             # 检查 SDK 是否激活
             if not s.sdkActive:
+                _log("sdkActive is False, returning None")
                 return None
 
             data = {
